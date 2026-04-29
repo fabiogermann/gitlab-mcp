@@ -34,40 +34,56 @@ docker compose up -d
 
 ## Multi-pod stateless-mode test bench
 
-A second compose file is shipped to reproduce the HPA-style scenario
-that stateless mode is designed to fix. It spins up **two** gitlab-mcp
-containers that share `OAUTH_STATELESS_SECRET` and sit behind an nginx
-round-robin load balancer, so consecutive requests of one MCP session
-land on different containers.
+Mirrors the production deployment at
+`source/repos/do/gitlab/gitlab-mcp` — same auth mode
+(`GITLAB_MCP_OAUTH` + `GITLAB_OAUTH_CALLBACK_PROXY`), same upstream
+GitLab contract — but replaces Traefik cookie stickiness with **no
+affinity at all**, which is what stateless mode makes safe.
+
+Spins up **two** gitlab-mcp containers sharing
+`OAUTH_STATELESS_SECRET` behind an nginx round-robin load balancer, so
+consecutive requests of one MCP session deterministically land on
+different containers.
 
 ```bash
 cd docker
 cp .env.stateless.example .env.stateless
-# edit .env.stateless — at minimum set GITLAB_API_URL and a secret:
-#   OAUTH_STATELESS_SECRET=$(openssl rand -base64 32)
+# edit .env.stateless — at minimum set:
+#   OAUTH_STATELESS_SECRET   (openssl rand -base64 32)
+#   GITLAB_API_URL           (e.g. https://gitserver.warrantymaster.com/api/v4)
+#   MCP_SERVER_URL           (public URL of the MCP endpoint)
+#   GITLAB_OAUTH_APP_ID      (GitLab OAuth app client_id, redirect URI
+#                             must be <MCP_SERVER_URL>/callback)
 
 docker compose -f docker-compose.stateless.yaml --env-file .env.stateless up
 ```
 
 Endpoints once up:
 
-| URL                            | What                                |
-| ------------------------------ | ----------------------------------- |
-| `http://127.0.0.1:3000/mcp`    | Load-balanced MCP endpoint          |
-| `http://127.0.0.1:3011/metrics`| Pod A metrics (direct)              |
-| `http://127.0.0.1:3012/metrics`| Pod B metrics (direct)              |
+| URL                                              | What                                 |
+| ------------------------------------------------ | ------------------------------------ |
+| `http://127.0.0.1:3000/mcp`                      | Load-balanced MCP endpoint           |
+| `http://127.0.0.1:3000/.well-known/oauth-*`      | OAuth discovery (via LB)             |
+| `http://127.0.0.1:3011/metrics`                  | Pod A metrics (direct)               |
+| `http://127.0.0.1:3012/metrics`                  | Pod B metrics (direct)               |
 
-Run the bundled smoke test to prove the cross-pod flow:
+Run the bundled smoke test:
 
 ```bash
-./test-stateless.sh <YOUR_GITLAB_PAT>
+./test-stateless.sh                  # OAuth discovery consistency only
+./test-stateless.sh <YOUR_GITLAB_PAT> # discovery + cross-pod /mcp flow
 ```
 
-The script sends an `initialize` request and a follow-up `tools/list`
-through the load balancer, checks the response status, shows which
-upstream served each request (via the `X-Upstream` header nginx adds),
-and confirms that the returned `Mcp-Session-Id` is a stateless sealed
-value (`v1.sid.…`).
+What the smoke test checks:
+
+1. **OAuth discovery from each pod and through the LB.** Three requests
+   through the LB hit both pods via round-robin; all must return the
+   same protected-resource metadata. This proves DCR works across pods
+   without affinity.
+2. **Cross-pod /mcp flow** (when a PAT is supplied). Sends `initialize`
+   → LB → pod A, followed by `tools/list` with the returned
+   `Mcp-Session-Id` → LB → pod B. Both succeed only because pod B can
+   open the sealed sid with the shared secret.
 
 To see the stateless flow from the server side, turn the log level up:
 
@@ -76,9 +92,25 @@ LOG_LEVEL=debug docker compose -f docker-compose.stateless.yaml \
   --env-file .env.stateless up
 ```
 
-Each request will emit one `stateless /mcp request` line containing
-the redacted sid prefix, the auth source (header vs sealed sid), and
-the header type. No tokens are logged.
+Each request emits one `stateless /mcp request` line with the redacted
+sid prefix, the auth source (header vs sealed sid), and the header
+type. No tokens are logged.
+
+### Completing the OAuth flow end-to-end
+
+The smoke test above verifies the infrastructure. To exercise the full
+OAuth consent flow with a real MCP client:
+
+1. Point your MCP client (Claude Desktop, Claude.ai, MCP Inspector,
+   etc.) at `http://127.0.0.1:3000/mcp` (or a public URL if you
+   reverse-proxy this stack).
+2. Confirm `MCP_SERVER_URL` matches what the client sees.
+3. In GitLab, register an OAuth application with redirect URI
+   `<MCP_SERVER_URL>/callback` and set `GITLAB_OAUTH_APP_ID`
+   accordingly.
+4. Start the client. It will walk you through the GitLab consent
+   screen. The browser redirect can land on either pod thanks to
+   round-robin — stateless mode makes that work without stickiness.
 
 ### Pinning to a specific image tag
 

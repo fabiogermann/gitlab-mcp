@@ -1,33 +1,31 @@
 ---
 # Multi-pod stateless-mode test bench.
 #
-# Spins up two identical gitlab-mcp containers sharing
-# OAUTH_STATELESS_SECRET, fronted by an nginx load balancer that
-# round-robins every request between them. This reproduces the exact
-# Kubernetes HPA scenario where consecutive requests of one logical
-# session land on different pods. Without stateless mode, /mcp would
-# fail on the first pod hop. With stateless mode, it works transparently.
+# Mirrors the production flow used at
+# source/repos/do/gitlab/gitlab-mcp (Kubernetes via the sp-microservice
+# module, Traefik in front, GitLab MCP OAuth with callback-proxy against
+# a self-hosted GitLab instance) — but trades Traefik cookie stickiness
+# for **no affinity at all**, which is what stateless mode makes safe.
+#
+# Two identical gitlab-mcp containers share OAUTH_STATELESS_SECRET and
+# sit behind an nginx round-robin load balancer. Consecutive requests
+# of one MCP session deterministically land on different containers,
+# reproducing the worst-case routing scenario that breaks today's
+# in-memory caches and which stateless mode makes transparent.
 #
 # Quick start:
 #   cd docker
 #   cp .env.stateless.example .env.stateless
-#   # edit .env.stateless — set GITLAB_API_URL and (optionally) a real
-#   # secret; defaults work for smoke testing.
+#   # edit .env.stateless — at minimum set:
+#   #   OAUTH_STATELESS_SECRET (openssl rand -base64 32)
+#   #   GITLAB_API_URL         (e.g. https://gitserver.warrantymaster.com/api/v4)
+#   #   MCP_SERVER_URL         (public URL of the MCP endpoint)
+#   #   GITLAB_OAUTH_APP_ID    (pre-registered GitLab OAuth app client_id)
 #   docker compose -f docker-compose.stateless.yaml --env-file .env.stateless up
 #
-# Once the stack is up, the load-balanced endpoint is:
-#   http://127.0.0.1:3000/mcp
-#
-# Each pod's /metrics endpoint is also exposed directly so you can see
-# request distribution:
-#   http://127.0.0.1:3011/metrics   (pod-a)
-#   http://127.0.0.1:3012/metrics   (pod-b)
-#
-# To prove the cross-pod flow works end-to-end, send an initialize
-# request followed by a tools/list request, both to the load-balanced
-# endpoint. Track the Mcp-Session-Id returned on init and include it on
-# the second call. Watch both /metrics endpoints to confirm the two
-# requests hit different containers.
+# Load-balanced MCP endpoint:  http://127.0.0.1:3000/mcp
+# Pod A metrics (direct):       http://127.0.0.1:3011/metrics
+# Pod B metrics (direct):       http://127.0.0.1:3012/metrics
 
 services:
   gitlab-mcp-a:
@@ -35,23 +33,43 @@ services:
     container_name: gitlab-mcp-a
     restart: unless-stopped
     ports:
-      # Expose the per-pod port for direct inspection (metrics, logs).
+      # Expose per-pod port for direct inspection (metrics, logs).
       # The load balancer on port 3000 is what normal callers should use.
       - "3011:3002"
     environment:
       HOST: 0.0.0.0
       PORT: "3002"
       STREAMABLE_HTTP: "true"
-      # Pick one auth mode. REMOTE_AUTHORIZATION is simplest for a smoke
-      # test — supply a Private-Token header on each request.
-      REMOTE_AUTHORIZATION: "true"
-      GITLAB_API_URL: ${GITLAB_API_URL:-https://gitlab.com/api/v4}
+
+      # --- Match the production flow ---------------------------------
+      # GitLab MCP OAuth proxy mode with callback-proxy enabled: only
+      # ONE GitLab OAuth application redirect URI has to be registered
+      # (MCP_SERVER_URL/callback), regardless of how many MCP clients
+      # connect.
+      GITLAB_MCP_OAUTH: "true"
+      GITLAB_OAUTH_CALLBACK_PROXY: "true"
+      GITLAB_API_URL: ${GITLAB_API_URL}
+      MCP_SERVER_URL: ${MCP_SERVER_URL}
+      GITLAB_OAUTH_APP_ID: ${GITLAB_OAUTH_APP_ID}
+      # Optional scope override; defaults to "api" (rw) / "read_api" (ro).
+      GITLAB_OAUTH_SCOPES: ${GITLAB_OAUTH_SCOPES:-}
+      # Allow plain-HTTP MCP_SERVER_URL when smoke-testing against localhost.
+      MCP_DANGEROUSLY_ALLOW_INSECURE_ISSUER_URL: ${MCP_DANGEROUSLY_ALLOW_INSECURE_ISSUER_URL:-false}
+
       GITLAB_READ_ONLY_MODE: ${GITLAB_READ_ONLY_MODE:-true}
-      # --- Stateless mode (the point of this compose file) ---
+
+      # --- Stateless mode (the point of this compose file) ------------
+      # With both pods sharing OAUTH_STATELESS_SECRET:
+      #   - signed client_id carries the DCR registration
+      #   - sealed OAuth state carries the /authorize → /callback hop
+      #   - sealed proxy code carries the /callback → /token hop
+      #   - sealed Mcp-Session-Id carries the /mcp session auth
+      # No in-memory caches, no sticky sessions, no shared store.
       OAUTH_STATELESS_MODE: "true"
       OAUTH_STATELESS_SECRET: ${OAUTH_STATELESS_SECRET}
-      # Optional rotation slot; leave empty by default
+      # Optional rotation slot; leave empty normally.
       OAUTH_STATELESS_SECRET_PREVIOUS: ${OAUTH_STATELESS_SECRET_PREVIOUS:-}
+
       LOG_LEVEL: ${LOG_LEVEL:-info}
     networks:
       - statelessnet
@@ -66,13 +84,22 @@ services:
       HOST: 0.0.0.0
       PORT: "3002"
       STREAMABLE_HTTP: "true"
-      REMOTE_AUTHORIZATION: "true"
-      GITLAB_API_URL: ${GITLAB_API_URL:-https://gitlab.com/api/v4}
+
+      GITLAB_MCP_OAUTH: "true"
+      GITLAB_OAUTH_CALLBACK_PROXY: "true"
+      GITLAB_API_URL: ${GITLAB_API_URL}
+      MCP_SERVER_URL: ${MCP_SERVER_URL}
+      GITLAB_OAUTH_APP_ID: ${GITLAB_OAUTH_APP_ID}
+      GITLAB_OAUTH_SCOPES: ${GITLAB_OAUTH_SCOPES:-}
+      MCP_DANGEROUSLY_ALLOW_INSECURE_ISSUER_URL: ${MCP_DANGEROUSLY_ALLOW_INSECURE_ISSUER_URL:-false}
+
       GITLAB_READ_ONLY_MODE: ${GITLAB_READ_ONLY_MODE:-true}
+
       OAUTH_STATELESS_MODE: "true"
       # IMPORTANT: same secret as pod-a
       OAUTH_STATELESS_SECRET: ${OAUTH_STATELESS_SECRET}
       OAUTH_STATELESS_SECRET_PREVIOUS: ${OAUTH_STATELESS_SECRET_PREVIOUS:-}
+
       LOG_LEVEL: ${LOG_LEVEL:-info}
     networks:
       - statelessnet
@@ -80,7 +107,12 @@ services:
   # Round-robin load balancer. Every request is dispatched to the next
   # backend, so no request pair goes to the same pod — this is the worst
   # case for session-bound in-memory state and the best case for proving
-  # that stateless mode actually works.
+  # that stateless mode works.
+  #
+  # In the production deployment this role is filled by Traefik with
+  # cookie stickiness (see deploy.tf::ingressroute.sticky). With
+  # stateless mode enabled, the stickiness becomes optional — that's
+  # what this compose demonstrates.
   lb:
     image: nginx:1.27-alpine
     container_name: gitlab-mcp-lb
