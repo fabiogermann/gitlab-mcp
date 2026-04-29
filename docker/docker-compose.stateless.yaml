@@ -1,0 +1,99 @@
+---
+# Multi-pod stateless-mode test bench.
+#
+# Spins up two identical gitlab-mcp containers sharing
+# OAUTH_STATELESS_SECRET, fronted by an nginx load balancer that
+# round-robins every request between them. This reproduces the exact
+# Kubernetes HPA scenario where consecutive requests of one logical
+# session land on different pods. Without stateless mode, /mcp would
+# fail on the first pod hop. With stateless mode, it works transparently.
+#
+# Quick start:
+#   cd docker
+#   cp .env.stateless.example .env.stateless
+#   # edit .env.stateless — set GITLAB_API_URL and (optionally) a real
+#   # secret; defaults work for smoke testing.
+#   docker compose -f docker-compose.stateless.yaml --env-file .env.stateless up
+#
+# Once the stack is up, the load-balanced endpoint is:
+#   http://127.0.0.1:3000/mcp
+#
+# Each pod's /metrics endpoint is also exposed directly so you can see
+# request distribution:
+#   http://127.0.0.1:3011/metrics   (pod-a)
+#   http://127.0.0.1:3012/metrics   (pod-b)
+#
+# To prove the cross-pod flow works end-to-end, send an initialize
+# request followed by a tools/list request, both to the load-balanced
+# endpoint. Track the Mcp-Session-Id returned on init and include it on
+# the second call. Watch both /metrics endpoints to confirm the two
+# requests hit different containers.
+
+services:
+  gitlab-mcp-a:
+    image: ${GITLAB_MCP_IMAGE:-ghcr.io/fabiogermann/gitlab-mcp:latest}
+    container_name: gitlab-mcp-a
+    restart: unless-stopped
+    ports:
+      # Expose the per-pod port for direct inspection (metrics, logs).
+      # The load balancer on port 3000 is what normal callers should use.
+      - "3011:3002"
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3002"
+      STREAMABLE_HTTP: "true"
+      # Pick one auth mode. REMOTE_AUTHORIZATION is simplest for a smoke
+      # test — supply a Private-Token header on each request.
+      REMOTE_AUTHORIZATION: "true"
+      GITLAB_API_URL: ${GITLAB_API_URL:-https://gitlab.com/api/v4}
+      GITLAB_READ_ONLY_MODE: ${GITLAB_READ_ONLY_MODE:-true}
+      # --- Stateless mode (the point of this compose file) ---
+      OAUTH_STATELESS_MODE: "true"
+      OAUTH_STATELESS_SECRET: ${OAUTH_STATELESS_SECRET}
+      # Optional rotation slot; leave empty by default
+      OAUTH_STATELESS_SECRET_PREVIOUS: ${OAUTH_STATELESS_SECRET_PREVIOUS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    networks:
+      - statelessnet
+
+  gitlab-mcp-b:
+    image: ${GITLAB_MCP_IMAGE:-ghcr.io/fabiogermann/gitlab-mcp:latest}
+    container_name: gitlab-mcp-b
+    restart: unless-stopped
+    ports:
+      - "3012:3002"
+    environment:
+      HOST: 0.0.0.0
+      PORT: "3002"
+      STREAMABLE_HTTP: "true"
+      REMOTE_AUTHORIZATION: "true"
+      GITLAB_API_URL: ${GITLAB_API_URL:-https://gitlab.com/api/v4}
+      GITLAB_READ_ONLY_MODE: ${GITLAB_READ_ONLY_MODE:-true}
+      OAUTH_STATELESS_MODE: "true"
+      # IMPORTANT: same secret as pod-a
+      OAUTH_STATELESS_SECRET: ${OAUTH_STATELESS_SECRET}
+      OAUTH_STATELESS_SECRET_PREVIOUS: ${OAUTH_STATELESS_SECRET_PREVIOUS:-}
+      LOG_LEVEL: ${LOG_LEVEL:-info}
+    networks:
+      - statelessnet
+
+  # Round-robin load balancer. Every request is dispatched to the next
+  # backend, so no request pair goes to the same pod — this is the worst
+  # case for session-bound in-memory state and the best case for proving
+  # that stateless mode actually works.
+  lb:
+    image: nginx:1.27-alpine
+    container_name: gitlab-mcp-lb
+    ports:
+      - "3000:80"
+    volumes:
+      - ./nginx.stateless.conf:/etc/nginx/conf.d/default.conf:ro
+    depends_on:
+      - gitlab-mcp-a
+      - gitlab-mcp-b
+    networks:
+      - statelessnet
+
+networks:
+  statelessnet:
+    driver: bridge
