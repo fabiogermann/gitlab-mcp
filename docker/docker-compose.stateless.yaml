@@ -29,7 +29,7 @@
 
 services:
   gitlab-mcp-a:
-    image: ${GITLAB_MCP_IMAGE:-ghcr.io/fabiogermann/gitlab-mcp:latest}
+    image: ${GITLAB_MCP_IMAGE:-ghcr.io/fabiogermann/gitlab-mcp:feat-stateless-mode}
     container_name: gitlab-mcp-a
     restart: unless-stopped
     ports:
@@ -75,7 +75,7 @@ services:
       - statelessnet
 
   gitlab-mcp-b:
-    image: ${GITLAB_MCP_IMAGE:-ghcr.io/fabiogermann/gitlab-mcp:latest}
+    image: ${GITLAB_MCP_IMAGE:-ghcr.io/fabiogermann/gitlab-mcp:feat-stateless-mode}
     container_name: gitlab-mcp-b
     restart: unless-stopped
     ports:
