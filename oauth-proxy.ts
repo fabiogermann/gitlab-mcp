@@ -64,6 +64,7 @@ import {
   looksLikeStatelessClientId,
   mintClientId,
   openClientId,
+  openClientIdLenient,
 } from "./stateless/client-id.js";
 import {
   looksLikeStatelessState,
@@ -126,6 +127,16 @@ export interface StatelessOAuthOptions {
   pendingTtlSeconds: number;
   /** TTL for sealed proxy authorization codes (default 600s). */
   storedTtlSeconds: number;
+  /**
+   * When true, a client_id that fails stateless verification with `expired`
+   * or `bad_signature` is still accepted by returning a minimal synthetic
+   * registration.  All other failure reasons continue to reject with
+   * `invalid_client`.
+   *
+   * Compatibility shim for workers-oauth-provider#201 (Cloudflare MCP
+   * Portal caches the client_id and cannot re-register transparently).
+   */
+  acceptExistingClientId: boolean;
 }
 
 /** Stored while user is on GitLab consent screen. Keyed by `state`. */
@@ -248,7 +259,8 @@ class GitLabOAuthServerProvider implements OAuthServerProvider {
       logger.info(
         `Stateless mode enabled (client_id TTL: ${stateless.clientTtlSeconds}s, ` +
           `pending TTL: ${stateless.pendingTtlSeconds}s, ` +
-          `stored TTL: ${stateless.storedTtlSeconds}s)`
+          `stored TTL: ${stateless.storedTtlSeconds}s, ` +
+          `acceptExistingClientId: ${stateless.acceptExistingClientId})`
       );
     }
   }
@@ -265,26 +277,54 @@ class GitLabOAuthServerProvider implements OAuthServerProvider {
         // Stateless path: a signed client_id carries the registration.
         // If verification succeeds, reconstruct the OAuthClientInformationFull.
         if (stateless && looksLikeStatelessClientId(clientId)) {
-          const payload = openClientId(
+          const result = openClientIdLenient(
             stateless.material,
             clientId,
             stateless.clientTtlSeconds
           );
-          if (!payload) {
-            logger.warn(`DCR: stateless client_id rejected (bad signature or expired)`);
-            // Mimic legacy behaviour: return a stub so the SDK surfaces the
-            // standard InvalidClientError path. We return null to let the SDK
-            // handler emit a proper OAuth error.
-            return undefined;
+          if (result.ok) {
+            const { payload } = result;
+            return {
+              client_id: clientId,
+              client_id_issued_at: payload.iat,
+              redirect_uris: payload.ruris,
+              token_endpoint_auth_method: "none",
+              grant_types: payload.gt ?? ["authorization_code"],
+              client_name: payload.cn ?? resourceName,
+            };
           }
-          return {
-            client_id: clientId,
-            client_id_issued_at: payload.iat,
-            redirect_uris: payload.ruris,
-            token_endpoint_auth_method: "none",
-            grant_types: payload.gt ?? ["authorization_code"],
-            client_name: payload.cn ?? resourceName,
-          };
+
+          // Verification failed — check if we should accept it leniently.
+          //
+          // Only `expired` is tolerated: the HMAC was valid so the payload is
+          // cryptographically trusted, only its freshness lapsed. The original
+          // `ruris` can be safely reused so the auth flow restarts.
+          //
+          // `bad_signature` is NOT tolerated even with the flag enabled. A bad
+          // signature means either (a) the operator performed a hard key
+          // rotation without a previous-secret grace window — an explicit
+          // decision to invalidate all outstanding client_ids — or (b) the
+          // token was forged. Both cases must be rejected. Operators who want
+          // a non-disruptive rotation MUST use OAUTH_STATELESS_SECRET_PREVIOUS.
+          const { reason } = result;
+          if (stateless.acceptExistingClientId && reason === "expired" && "expiredPayload" in result) {
+            const redirectUris = result.expiredPayload.ruris;
+            logger.warn(
+              `DCR: stateless client_id accepted leniently (reason=expired). ` +
+              `OAUTH_ACCEPT_EXISTING_CLIENT_ID is enabled — returning synthetic stub ` +
+              `with ${redirectUris.length} redirect_uri(s).`
+            );
+            return {
+              client_id: clientId,
+              redirect_uris: redirectUris,
+              token_endpoint_auth_method: "none" as const,
+              grant_types: ["authorization_code"],
+              client_name: resourceName,
+            };
+          }
+
+          logger.warn(`DCR: stateless client_id rejected (reason=${reason})`);
+          return undefined;
         }
 
         const cached = cache.get(clientId);

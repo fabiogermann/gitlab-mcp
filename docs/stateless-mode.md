@@ -97,6 +97,7 @@ Cryptography:
 | `OAUTH_STATELESS_PENDING_TTL_SECONDS`     | `600`                          | Max age for a sealed OAuth `state`.                    |
 | `OAUTH_STATELESS_STORED_TTL_SECONDS`      | `600`                          | Max age for a sealed proxy `code`.                     |
 | `OAUTH_STATELESS_SESSION_TTL_SECONDS`     | inherits `SESSION_TIMEOUT_SECONDS` | Inactivity timeout for a sealed `Mcp-Session-Id`.  |
+| `OAUTH_ACCEPT_EXISTING_CLIENT_ID`         | `false`                        | Cloudflare Portal compat — see below.                  |
 
 CLI arguments take the same names with dashes (e.g. `--oauth-stateless-mode=true`).
 
@@ -111,6 +112,63 @@ On suspected compromise, rotate `OAUTH_STATELESS_SECRET` without setting
 `_PREVIOUS` — this immediately invalidates every outstanding client_id,
 session, pending auth, and proxy code. Clients must re-register and
 re-authenticate.
+
+## Cloudflare MCP Portal compatibility (`OAUTH_ACCEPT_EXISTING_CLIENT_ID`)
+
+The [Cloudflare MCP Portal](https://github.com/cloudflare/workers-oauth-provider/issues/201)
+caches the DCR `client_id` and reuses it across sessions. If the server
+rejects that cached `client_id` with `invalid_client` — most commonly because
+its TTL has lapsed — the Portal surfaces an error to the user instead of
+re-registering transparently.
+
+Setting `OAUTH_ACCEPT_EXISTING_CLIENT_ID=true` instructs the server to accept
+a stateless `client_id` whose TTL has lapsed (`expired`) and return a
+synthetic client registration that carries the original (signature-verified)
+redirect URIs, so the SDK's authorize handler can match the redirect URI and
+restart the auth flow transparently.
+
+**Only `expired` is tolerated.** A `bad_signature` failure — which would
+result from a hard key rotation (rotating `OAUTH_STATELESS_SECRET` without
+setting `_PREVIOUS`) or a forged token — continues to be rejected even with
+the flag enabled. This preserves hard rotation as a tool for invalidating
+every outstanding `client_id`. All other failure reasons (`malformed`,
+`future_iat`, `bad_schema`, `purpose_mismatch`, etc.) continue to reject as
+well.
+
+For graceful (non-disruptive) key rotation that keeps existing clients
+working, use `OAUTH_STATELESS_SECRET_PREVIOUS` — that is the supported
+migration path.
+
+**What the synthetic stub contains (expired case only):**
+
+| Field                       | Value                                          |
+| --------------------------- | ---------------------------------------------- |
+| `client_id`                 | the presented (expired) `client_id`            |
+| `redirect_uris`             | the original `ruris` from the expired payload  |
+| `token_endpoint_auth_method`| `"none"`                                       |
+| `grant_types`               | `["authorization_code"]`                       |
+| `client_name`               | server's resource name                         |
+
+Because the HMAC signature was valid (only the TTL lapsed), the redirect URIs
+in the original payload are cryptographically trusted and can be safely
+reused.
+
+**Security trade-off:**
+
+This flag relaxes TTL enforcement on signed `client_id`s. The HMAC signature
+is still verified, so the embedded redirect URIs cannot be tampered with.
+Hard key rotation still works as expected — rotating the secret without
+`_PREVIOUS` invalidates every outstanding `client_id` regardless of this
+flag's value.
+
+DCR is open-registration — an attacker can call `/register` directly — so
+relaxing TTL does not grant new capabilities. Redirect-URI enforcement at
+`/authorize` → `/token` is still performed by the existing PKCE check.
+
+Only enable this flag when deploying alongside clients (such as the
+Cloudflare MCP Portal) that cache `client_id` values and cannot recover
+transparently from `invalid_client` errors. Do not enable it if you rely on
+TTL-based `client_id` expiry as a security control.
 
 ## Security model
 

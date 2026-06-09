@@ -191,6 +191,43 @@ Misconfigurations never produce `NaN` — this guarantees the TTL check in
 the stateless codec (`ttlSec > 0` in `checkIat`) always enforces an
 inactivity window for sealed sids.
 
+### `OAUTH_ACCEPT_EXISTING_CLIENT_ID`
+
+**Default:** `false`
+
+When `true`, the stateless `getClient` path will accept a signed `client_id`
+whose TTL has lapsed (`expired`), returning a synthetic client registration
+that carries the original (signature-verified) redirect URIs so the auth flow
+can restart transparently.
+
+**Only `expired` is tolerated.** All other failure reasons — including
+`bad_signature` (which would indicate either a hard key rotation or a forged
+token), `malformed`, `future_iat`, `bad_schema`, etc. — are still rejected.
+This preserves hard key rotation (rotating `OAUTH_STATELESS_SECRET` without
+setting `OAUTH_STATELESS_SECRET_PREVIOUS`) as a tool for invalidating every
+outstanding `client_id`.
+
+For graceful key rotation that keeps existing clients working, use
+[`OAUTH_STATELESS_SECRET_PREVIOUS`](#oauth_stateless_secret_previous) — that
+is the supported migration path.
+
+**When to use:** Enable this flag when using the
+[Cloudflare MCP Portal](https://github.com/cloudflare/workers-oauth-provider/issues/201),
+which caches the DCR `client_id` and cannot re-register transparently on
+rejection. The flag transparently recovers from TTL expiry — the dominant
+failure mode in that scenario.
+
+**Security note:** Enabling this flag relaxes TTL enforcement on signed
+`client_id`s. The HMAC signature is still verified, so the embedded
+redirect URIs cannot be tampered with. DCR is open-registration (any client
+can call `/register` directly), so an attacker gains no capability they
+couldn't already obtain. Redirect-URI validation at `/authorize` → `/token`
+remains enforced by the existing PKCE check. See
+[stateless-mode.md](./stateless-mode.md#cloudflare-mcp-portal-compatibility-oauth_accept_existing_client_id)
+for a full discussion of the trade-offs.
+
+CLI equivalent: `--oauth-accept-existing-client-id=true`
+
 ## Core GitLab Configuration
 
 ### `GITLAB_API_URL`

@@ -154,6 +154,28 @@ export const OAUTH_STATELESS_STORED_TTL_SECONDS = _intEnv(
   600
 );
 
+/**
+ * When true, the stateless `getClient` path will accept a client_id whose
+ * signature has expired or whose HMAC no longer verifies (e.g. after a key
+ * rotation), returning a minimal synthetic client registration instead of
+ * rejecting the request with `invalid_client`.
+ *
+ * Only `expired` and `bad_signature` failures are tolerated — structurally
+ * invalid or malformed values are still rejected.
+ *
+ * Intended as a compatibility shim for the Cloudflare MCP Portal
+ * (workers-oauth-provider#201), which caches the client_id and cannot
+ * re-register transparently on rejection.
+ *
+ * Security note: DCR is open-registration; an attacker can always call
+ * /register directly.  Enabling this flag relaxes TTL enforcement and
+ * tamper-detection on the embedded redirect_uris inside the client_id itself.
+ * Redirect-uri validation at /authorize → /token is still enforced by the
+ * existing PKCE check.
+ */
+export const OAUTH_ACCEPT_EXISTING_CLIENT_ID =
+  getConfig("oauth-accept-existing-client-id", "OAUTH_ACCEPT_EXISTING_CLIENT_ID") === "true";
+
 // ---------------------------------------------------------------------------
 // Session / server settings
 // ---------------------------------------------------------------------------

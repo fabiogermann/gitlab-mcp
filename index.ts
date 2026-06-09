@@ -27,6 +27,7 @@ import {
   OAUTH_STATELESS_PENDING_TTL_SECONDS,
   OAUTH_STATELESS_SESSION_TTL_SECONDS,
   OAUTH_STATELESS_STORED_TTL_SECONDS,
+  OAUTH_ACCEPT_EXISTING_CLIENT_ID,
   PORT,
   REMOTE_AUTHORIZATION,
   SESSION_TIMEOUT_SECONDS,
@@ -12095,6 +12096,7 @@ async function startStreamableHTTPServer(): Promise<void> {
             clientTtlSeconds: OAUTH_STATELESS_CLIENT_TTL_SECONDS,
             pendingTtlSeconds: OAUTH_STATELESS_PENDING_TTL_SECONDS,
             storedTtlSeconds: OAUTH_STATELESS_STORED_TTL_SECONDS,
+            acceptExistingClientId: OAUTH_ACCEPT_EXISTING_CLIENT_ID,
           }
         : null;
     const oauthProvider = createGitLabOAuthProvider(

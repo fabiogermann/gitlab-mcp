@@ -42,8 +42,9 @@ export {
   looksLikeStatelessClientId,
   mintClientId,
   openClientId,
+  openClientIdLenient,
 } from "./client-id.js";
-export type { ClientIdPayload, MintClientIdInput } from "./client-id.js";
+export type { ClientIdPayload, MintClientIdInput, OpenClientIdLenientResult } from "./client-id.js";
 
 export {
   looksLikeStatelessState,

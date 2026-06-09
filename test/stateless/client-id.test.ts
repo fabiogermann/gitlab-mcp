@@ -56,6 +56,7 @@ function makeProvider(
           clientTtlSeconds: 86400,
           pendingTtlSeconds: 600,
           storedTtlSeconds: 600,
+          acceptExistingClientId: false,
         }
       : null
   );
